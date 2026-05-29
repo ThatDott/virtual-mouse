@@ -128,19 +128,24 @@ def _draw_landmarks(frame: np.ndarray, landmarks: list) -> np.ndarray:
 
 
 class HandTracker:
-    """Manages the webcam and the MediaPipe HandLandmarker detector.
+    """Manages the webcam (or video file) and the MediaPipe HandLandmarker detector.
 
     This class is the bridge between the physical camera and our CV
     pipeline.  It handles:
-      - Opening and configuring the camera
+      - Opening and configuring the camera or a video file
       - Loading the pre-trained .task model via the Tasks API
-      - Reading and flipping frames
+      - Reading and flipping frames (live camera only)
       - Running the deep learning model on each frame
       - Drawing the detection results (landmarks + skeleton)
       - Cleanly releasing resources when done
     """
 
-    def __init__(self, model_path: str, camera_id: int = 0):
+    def __init__(
+        self,
+        model_path: str,
+        camera_id: int = 0,
+        video_path: str | None = None,
+    ):
         """
         Parameters
         ----------
@@ -148,9 +153,15 @@ class HandTracker:
             File path to the ``hand_landmarker.task`` model asset.
         camera_id : int, optional
             The device index of the webcam (0 = default camera).
+            Ignored when ``video_path`` is provided.
+        video_path : str | None, optional
+            Path to a video file to use as input instead of the webcam.
+            Supported formats: anything OpenCV can decode (mp4, avi, mov, …).
         """
         self._model_path = model_path
         self._camera_id = camera_id
+        self._video_path = video_path
+        self._is_video = video_path is not None
 
         # These are created in start() — None before that.
         self._cap: cv2.VideoCapture | None = None
@@ -181,15 +192,20 @@ class HandTracker:
         bool
             True if the camera and model loaded successfully.
         """
-        # STEP 1 & 2: open the camera
-        self._cap = cv2.VideoCapture(self._camera_id)
+        # STEP 1 & 2: open the camera or video file.
+        # cv2.VideoCapture accepts both integer device IDs and file path strings.
+        source = self._video_path if self._is_video else self._camera_id
+        self._cap = cv2.VideoCapture(source)
         if not self._cap.isOpened():
             self._cap = None
             return False
 
-        # STEP 3: configure and read back actual resolution
-        self._cap.set(cv2.CAP_PROP_FRAME_WIDTH, self.frame_width)
-        self._cap.set(cv2.CAP_PROP_FRAME_HEIGHT, self.frame_height)
+        # STEP 3: configure resolution.
+        # For a live camera we request 640×480 and read back the actual value.
+        # For a video file the resolution is fixed by the file itself.
+        if not self._is_video:
+            self._cap.set(cv2.CAP_PROP_FRAME_WIDTH, self.frame_width)
+            self._cap.set(cv2.CAP_PROP_FRAME_HEIGHT, self.frame_height)
 
         actual_w = self._cap.get(cv2.CAP_PROP_FRAME_WIDTH)
         actual_h = self._cap.get(cv2.CAP_PROP_FRAME_HEIGHT)
@@ -227,13 +243,19 @@ class HandTracker:
 
         ret, frame = self._cap.read()
         if not ret:
-            return False, None
+            if self._is_video:
+                # End of file — seek back to the first frame and loop.
+                self._cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
+                ret, frame = self._cap.read()
+                if not ret:
+                    return False, None
+            else:
+                return False, None
 
-        # Mirror the frame so the display is intuitive (like a mirror).
-        # cv2.flip(frame, 1):  1  = horizontal flip
-        # cv2.flip(frame, 0):  0  = vertical flip
-        # cv2.flip(frame, -1): -1 = both
-        frame = cv2.flip(frame, 1)
+        # Mirror only live camera frames so the display is intuitive.
+        # Video files are already oriented correctly (no flip needed).
+        if not self._is_video:
+            frame = cv2.flip(frame, 1)
         return True, frame
 
     def detect(self, frame: np.ndarray) -> tuple[np.ndarray, list | None]:
