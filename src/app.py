@@ -66,6 +66,7 @@ import queue
 import threading
 import time
 import tkinter as tk
+import tkinter.filedialog as filedialog
 
 import customtkinter as ctk
 import cv2
@@ -136,6 +137,7 @@ class AppGui:
         self._thread: threading.Thread | None = None
         self._frame_queue: queue.Queue[dict] = queue.Queue(maxsize=2)
         self._photo: ImageTk.PhotoImage | None = None  # keep a reference!
+        self._video_path: str | None = None       # path to uploaded video file
 
         # --- STEP 5: Screen dimensions ---
         self._screen_w = self.root.winfo_screenwidth()
@@ -149,6 +151,7 @@ class AppGui:
 
         # --- STEP 6 & 7: Build GUI + start polling ---
         self._build_ui()
+        self._bind_keys()
         self._poll_frame_queue()
 
         # --- STEP 8: Enter main loop ---
@@ -224,21 +227,44 @@ class AppGui:
         self.source_var = ctk.StringVar(value="Live Webcam")
         ctk.CTkOptionMenu(
             right,
-            values=["Live Webcam", "Test Video"],
+            values=["Live Webcam", "Upload Video"],
             variable=self.source_var,
             command=self._on_source_change,
-        ).grid(row=row, column=0, sticky="ew", pady=(0, 8))
+        ).grid(row=row, column=0, sticky="ew", pady=(0, 4))
         row += 1
 
-        ctk.CTkLabel(right, text="Camera ID:").grid(
-            row=row, column=0, sticky="w"
-        )
+        # Container that swaps between the camera-ID entry and the video
+        # browse button depending on which source is selected.
+        src_input = ctk.CTkFrame(right, fg_color="transparent")
+        src_input.grid(row=row, column=0, sticky="ew", pady=(0, 8))
         row += 1
+
+        # --- Live webcam: camera device ID entry ---
+        self._cam_id_frame = ctk.CTkFrame(src_input, fg_color="transparent")
+        self._cam_id_frame.pack(fill=tk.X)
+        cam_row = ctk.CTkFrame(self._cam_id_frame, fg_color="transparent")
+        cam_row.pack(fill=tk.X)
+        ctk.CTkLabel(cam_row, text="Camera ID:").pack(side=tk.LEFT)
         self.cam_id_var = ctk.StringVar(value="0")
-        ctk.CTkEntry(right, textvariable=self.cam_id_var, width=60).grid(
-            row=row, column=0, sticky="w", pady=(0, 10)
+        ctk.CTkEntry(cam_row, textvariable=self.cam_id_var, width=60).pack(
+            side=tk.LEFT, padx=(6, 0)
         )
-        row += 1
+
+        # --- Upload video: browse button + filename display ---
+        self._video_browse_frame = ctk.CTkFrame(src_input, fg_color="transparent")
+        # Not packed initially — shown only when "Upload Video" is selected.
+        ctk.CTkButton(
+            self._video_browse_frame,
+            text="Browse Video…",
+            command=self._browse_video,
+        ).pack(fill=tk.X)
+        self._video_name_label = ctk.CTkLabel(
+            self._video_browse_frame,
+            text="No file selected",
+            anchor="w",
+            wraplength=260,
+        )
+        self._video_name_label.pack(fill=tk.X, pady=(4, 0))
 
         self._add_separator(right, row)
         row += 1
@@ -327,10 +353,16 @@ class AppGui:
         row += 1
 
         self.mouse_switch = ctk.CTkSwitch(
-            right, text="Mouse Control",
+            right, text="Mouse Control  [Space]",
             command=self._toggle_mouse, onvalue=True, offvalue=False,
         )
-        self.mouse_switch.grid(row=row, column=0, sticky="w", pady=(0, 10))
+        self.mouse_switch.grid(row=row, column=0, sticky="w", pady=(0, 4))
+        row += 1
+
+        ctk.CTkLabel(
+            right, text="Esc — stop session",
+            font=ctk.CTkFont(size=11), text_color="#888888",
+        ).grid(row=row, column=0, sticky="w", pady=(0, 8))
         row += 1
 
         self._add_separator(right, row)
@@ -400,9 +432,50 @@ class AppGui:
         if self.engine is not None:
             self.engine.set_threshold(val)
 
-    def _on_source_change(self, _choice: str):
-        """Input source selector (placeholder for future video file support)."""
-        pass
+    def _on_source_change(self, choice: str):
+        """Toggle the source-specific input area between camera ID and file browse."""
+        if choice == "Live Webcam":
+            self._video_browse_frame.pack_forget()
+            self._cam_id_frame.pack(fill=tk.X)
+        else:
+            self._cam_id_frame.pack_forget()
+            self._video_browse_frame.pack(fill=tk.X)
+
+    def _browse_video(self):
+        """Open a file-picker dialog and store the selected video path."""
+        path = filedialog.askopenfilename(
+            title="Select a video file",
+            filetypes=[
+                ("Video files", "*.mp4 *.avi *.mov *.mkv *.wmv *.flv *.webm"),
+                ("All files", "*.*"),
+            ],
+        )
+        if path:
+            self._video_path = path
+            self._video_name_label.configure(text=os.path.basename(path))
+
+    def _bind_keys(self):
+        """Register global keyboard shortcuts on the root window.
+
+        Space  — toggle mouse control on/off (primary escape hatch).
+        Escape — stop the camera / video session entirely.
+
+        Both keys are no-ops when the app is in IDLE state.
+        """
+        self.root.bind("<space>", self._on_key_toggle_mouse)
+        self.root.bind("<Escape>", self._on_key_stop)
+
+    def _on_key_toggle_mouse(self, _event=None):
+        """Space bar: flip the mouse-control switch and apply the change."""
+        if self.state not in (self.CALIBRATING, self.ACTIVE_TRACKING):
+            return
+        self.mouse_switch.toggle()
+        self._toggle_mouse()
+
+    def _on_key_stop(self, _event=None):
+        """Escape key: stop the camera / video and return to IDLE."""
+        if self.state != self.IDLE:
+            self._stop_camera()
 
     # --------------------------------------------------------------- #
     #  State transitions
@@ -485,18 +558,32 @@ class AppGui:
             )
             return
 
-        # STEP 2: Parse camera ID
-        try:
-            cam_id = int(self.cam_id_var.get().strip())
-        except ValueError:
-            cam_id = 0
-
-        # STEP 3: Start the hand tracker (Technique 1)
-        self.tracker = HandTracker(model_path=model_path, camera_id=cam_id)
-        if not self.tracker.start():
-            self.state_label.configure(
-                text="State: ERROR - cannot open camera"
+        # STEP 2: Determine the video source (live camera or uploaded file).
+        use_video = self.source_var.get() == "Upload Video"
+        if use_video:
+            if not self._video_path:
+                self.state_label.configure(
+                    text="State: ERROR - no video file selected"
+                )
+                return
+            self.tracker = HandTracker(
+                model_path=model_path, video_path=self._video_path
             )
+        else:
+            try:
+                cam_id = int(self.cam_id_var.get().strip())
+            except ValueError:
+                cam_id = 0
+            self.tracker = HandTracker(model_path=model_path, camera_id=cam_id)
+
+        # STEP 3: Open the source and load the DL model.
+        if not self.tracker.start():
+            msg = (
+                "State: ERROR - cannot open video file"
+                if use_video
+                else "State: ERROR - cannot open camera"
+            )
+            self.state_label.configure(text=msg)
             self.tracker = None
             return
 
